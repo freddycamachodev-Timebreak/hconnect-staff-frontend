@@ -9,6 +9,8 @@ const cormorant = Cormorant_Garamond({
   weight: ["400", "500", "600"]
 });
 
+const API_URL = "http://localhost:4000";
+
 type Message = {
   id?: string;
   messageId?: string;
@@ -19,21 +21,51 @@ type Message = {
   timestamp: string;
 };
 
+type Suite = {
+  suiteId: string;
+  roomId: string;
+  status: string;
+  updatedBy: string | null;
+  updatedAt: string | null;
+  priority: string;
+  vip: boolean;
+  lastMessageAt: string | null;
+  unresolvedCount: number;
+};
+
+const statusConfig: Record<string, { label: string; color: string }> = {
+  waiting: { label: "Waiting", color: "#F59E0B" },
+  active: { label: "Active", color: "#22C55E" },
+  pending: { label: "Pending", color: "#F97316" },
+  resolved: { label: "Resolved", color: "#94A3B8" },
+  checkout: { label: "Checkout", color: "#64748B" },
+  offline: { label: "Offline", color: "#57534E" }
+};
+
 export default function StaffChat() {
   const currentUser = "staff";
 
   const [message, setMessage] = useState("");
   const [messages, setMessages] = useState<Message[]>([]);
-  const [rooms, setRooms] = useState<string[]>([]);
+  const [suites, setSuites] = useState<Suite[]>([]);
   const [selectedRoom, setSelectedRoom] = useState<string | null>(null);
   const [unreadRooms, setUnreadRooms] = useState<string[]>([]);
   const [darkMode, setDarkMode] = useState(false);
   const [isTyping, setIsTyping] = useState(false);
-  const [roomStatus, setRoomStatus] = useState<Record<string, string>>({});
+  const [currentTime, setCurrentTime] = useState(0);
 
   const messagesContainerRef = useRef<HTMLDivElement | null>(null);
   const typingTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const selectedRoomRef = useRef<string | null>(null);
+
+  const selectedSuite = suites.find((suite) => suite.roomId === selectedRoom);
+
+  const fetchQueue = async () => {
+    const response = await fetch(`${API_URL}/suites/queue`);
+    const data = await response.json();
+
+    setSuites(data.suites || []);
+  };
 
   useEffect(() => {
     selectedRoomRef.current = selectedRoom;
@@ -44,8 +76,14 @@ export default function StaffChat() {
       socket.connect();
     }
 
-    socket.on("activeRooms", (activeRooms: string[]) => {
-      setRooms(activeRooms);
+    socket.on("activeRooms", () => {
+      fetchQueue().catch((error) => {
+        console.error("Error loading suite queue:", error);
+      });
+    });
+
+    socket.on("queueUpdated", (updatedSuites: Suite[]) => {
+      setSuites(updatedSuites);
     });
 
     socket.on("chatHistory", (history: Message[]) => {
@@ -87,18 +125,31 @@ export default function StaffChat() {
       setIsTyping(false);
     });
 
-    fetch("http://localhost:4000/rooms")
-      .then((res) => res.json())
-      .then((data) => {
-        setRooms(data.rooms || []);
+    const queueTimeoutId = window.setTimeout(() => {
+      fetchQueue().catch((error) => {
+        console.error("Error loading suite queue:", error);
       });
+    }, 0);
+
+    const clockTimeoutId = window.setTimeout(() => {
+      setCurrentTime(Date.now());
+    }, 0);
+
+    const clockIntervalId = window.setInterval(() => {
+      setCurrentTime(Date.now());
+    }, 60000);
 
     return () => {
       if (typingTimeoutRef.current) {
         clearTimeout(typingTimeoutRef.current);
       }
 
+      window.clearTimeout(queueTimeoutId);
+      window.clearTimeout(clockTimeoutId);
+      window.clearInterval(clockIntervalId);
+
       socket.off("activeRooms");
+      socket.off("queueUpdated");
       socket.off("chatHistory");
       socket.off("receiveMessage");
       socket.off("newRoomMessage");
@@ -108,22 +159,53 @@ export default function StaffChat() {
     };
   }, []);
 
-    const openRoom = (roomId: string) => {
+  const updateSuiteStatus = async (roomId: string, status: string) => {
+    const suiteId = roomId.replace(/^room-/, "");
+
+    try {
+      const response = await fetch(`${API_URL}/suites/${suiteId}/status`, {
+        method: "PUT",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          status,
+          roomId,
+          updatedBy: currentUser
+        })
+      });
+
+      if (!response.ok) {
+        throw new Error("Suite status update failed");
+      }
+
+      const updatedSuite = await response.json();
+
+      setSuites((prev) =>
+        prev.map((suite) =>
+          suite.roomId === roomId ? { ...suite, ...updatedSuite } : suite
+        )
+      );
+    } catch (error) {
+      console.error("Error updating suite status:", error);
+    }
+  };
+
+    const openRoom = (roomId: string, currentStatus?: string) => {
       setSelectedRoom(roomId);
 
       setUnreadRooms((prev) =>
         prev.filter((room) => room !== roomId)
       );
 
-      setRoomStatus((prev) => ({
-        ...prev,
-        [roomId]: "active"
-      }));
-
       socket.emit("joinRoom", {
         roomId,
         userType: currentUser
       });
+
+      if (currentStatus === "waiting" || currentStatus === "pending") {
+        updateSuiteStatus(roomId, "active");
+      }
     };
 
   const sendMessage = () => {
@@ -143,6 +225,27 @@ export default function StaffChat() {
       hour: "2-digit",
       minute: "2-digit"
     });
+  };
+
+  const formatRelativeTime = (timestamp: string | null) => {
+    if (!timestamp) {
+      return "Sin actividad";
+    }
+
+    const diffMinutes = Math.max(
+      0,
+      Math.floor((currentTime - new Date(timestamp).getTime()) / 60000)
+    );
+
+    if (diffMinutes < 1) {
+      return "Ahora";
+    }
+
+    if (diffMinutes < 60) {
+      return `Hace ${diffMinutes} min`;
+    }
+
+    return `Hace ${Math.floor(diffMinutes / 60)} h`;
   };
 
   return (
@@ -246,14 +349,18 @@ export default function StaffChat() {
               gap: 16
             }}
           >
-            {rooms.map((room) => {
+            {suites.map((suite) => {
+              const room = suite.roomId;
               const isSelected = selectedRoom === room;
-              const hasUnread = unreadRooms.includes(room);
+              const hasUnread =
+                unreadRooms.includes(room) || suite.unresolvedCount > 0;
+              const operationalStatus =
+                statusConfig[suite.status] || statusConfig.waiting;
 
               return (
                 <button
                   key={room}
-                  onClick={() => openRoom(room)}
+                  onClick={() => openRoom(room, suite.status)}
                   style={{
                     padding: "20px 22px",
                     borderRadius: 20,
@@ -310,29 +417,26 @@ export default function StaffChat() {
               style={{
                 fontSize: 11,
                 fontWeight: 800,
-                color:
-                  roomStatus[room] === "active"
-                    ? "#22c55e"
-                    : roomStatus[room] === "resolved"
-                    ? darkMode
-                      ? "#CBD5E1"
-                      : "#64748B"
-                    : isSelected
-                    ? "#2B241C"
-                    : darkMode
-                    ? "#E5D3A1"
-                    : "#B08968"
+                color: isSelected ? "#2B241C" : operationalStatus.color
               }}
             >
-              {roomStatus[room] === "active"
+              {suite.status === "active"
                 ? "● En atención"
-                : roomStatus[room] === "resolved"
+                : suite.status === "resolved"
                 ? "✓ Resuelto"
                 : "○ Esperando"}
             </span>
           </div>
 
-          {hasUnread && (
+          <div
+            style={{
+              display: "flex",
+              flexDirection: "column",
+              alignItems: "flex-end",
+              gap: 5
+            }}
+          >
+          {(hasUnread || suite.vip) && (
             <span
               style={{
                 color: isSelected
@@ -345,9 +449,49 @@ export default function StaffChat() {
                 whiteSpace: "nowrap"
               }}
             >
-              ● Nuevo
+              {suite.vip ? "VIP" : "Nuevo"}
             </span>
           )}
+            <span
+              style={{
+                color: isSelected ? "#2B241C" : operationalStatus.color,
+                fontSize: 11,
+                fontWeight: 900,
+                whiteSpace: "nowrap"
+              }}
+            >
+              {operationalStatus.label}
+            </span>
+            <span
+              style={{
+                color: isSelected
+                  ? "#2B241C"
+                  : darkMode
+                  ? "#B8A88F"
+                  : "#7A6A58",
+                fontSize: 11,
+                fontWeight: 800,
+                whiteSpace: "nowrap"
+              }}
+            >
+              {suite.unresolvedCount} pendientes
+            </span>
+
+            <span
+              style={{
+                color: isSelected
+                  ? "#2B241C"
+                  : darkMode
+                  ? "#9B8A75"
+                  : "#8A7A66",
+                fontSize: 11,
+                fontWeight: 700,
+                whiteSpace: "nowrap"
+              }}
+            >
+              {formatRelativeTime(suite.lastMessageAt)}
+            </span>
+          </div>
         </div>
                 </button>
               );
@@ -387,15 +531,30 @@ export default function StaffChat() {
           >
             Atención personalizada al huésped
           </p>
+          {selectedSuite && (
+            <div
+              style={{
+                display: "flex",
+                gap: 12,
+                alignItems: "center",
+                marginBottom: 18,
+                color: darkMode ? "#CDBFAD" : "#7A6A58",
+                fontSize: 13,
+                fontWeight: 800
+              }}
+            >
+              <span style={{ color: statusConfig[selectedSuite.status]?.color }}>
+                {statusConfig[selectedSuite.status]?.label || selectedSuite.status}
+              </span>
+              <span>{selectedSuite.unresolvedCount} pendientes</span>
+              <span>{formatRelativeTime(selectedSuite.lastMessageAt)}</span>
+              {selectedSuite.vip && <span>VIP</span>}
+            </div>
+          )}
           {selectedRoom && (
             <div style={{ display: "flex", gap: 10, marginBottom: 20 }}>
               <button
-                onClick={() =>
-                  setRoomStatus((prev) => ({
-                    ...prev,
-                    [selectedRoom]: "active"
-                  }))
-                }
+                onClick={() => updateSuiteStatus(selectedRoom, "active")}
                 style={{
                   padding: "10px 16px",
                   borderRadius: 14,
@@ -410,12 +569,7 @@ export default function StaffChat() {
               </button>
 
               <button
-                onClick={() =>
-                  setRoomStatus((prev) => ({
-                    ...prev,
-                    [selectedRoom]: "resolved"
-                  }))
-                }
+                onClick={() => updateSuiteStatus(selectedRoom, "resolved")}
                 style={{
                   padding: "10px 16px",
                   borderRadius: 14,
@@ -430,12 +584,7 @@ export default function StaffChat() {
               </button>
 
               <button
-                onClick={() =>
-                  setRoomStatus((prev) => ({
-                    ...prev,
-                    [selectedRoom]: "waiting"
-                  }))
-                }
+                onClick={() => updateSuiteStatus(selectedRoom, "waiting")}
                 style={{
                   padding: "10px 16px",
                   borderRadius: 14,
