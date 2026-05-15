@@ -1,15 +1,13 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { io } from "socket.io-client";
 import { Cormorant_Garamond } from "next/font/google";
+import { socket } from "@/lib/socket";
 
 const cormorant = Cormorant_Garamond({
   subsets: ["latin"],
   weight: ["400", "500", "600"]
 });
-
-const socket = io("http://localhost:4000");
 
 type Message = {
   id?: string;
@@ -31,12 +29,21 @@ export default function StaffChat() {
   const [unreadRooms, setUnreadRooms] = useState<string[]>([]);
   const [darkMode, setDarkMode] = useState(false);
   const [isTyping, setIsTyping] = useState(false);
-
+  const [roomStatus, setRoomStatus] = useState<Record<string, string>>({});
 
   const messagesContainerRef = useRef<HTMLDivElement | null>(null);
   const typingTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const selectedRoomRef = useRef<string | null>(null);
 
   useEffect(() => {
+    selectedRoomRef.current = selectedRoom;
+  }, [selectedRoom]);
+
+  useEffect(() => {
+    if (!socket.connected) {
+      socket.connect();
+    }
+
     socket.on("activeRooms", (activeRooms: string[]) => {
       setRooms(activeRooms);
     });
@@ -53,7 +60,7 @@ export default function StaffChat() {
     });
 
     socket.on("receiveMessage", (data: Message) => {
-      if (data.roomId === selectedRoom) {
+      if (data.roomId === selectedRoomRef.current) {
         setMessages((prev) => [...prev, data]);
 
         setTimeout(() => {
@@ -66,7 +73,7 @@ export default function StaffChat() {
     });
 
     socket.on("newRoomMessage", (data: Message) => {
-      if (data.sender === "guest" && data.roomId !== selectedRoom) {
+      if (data.sender === "guest" && data.roomId !== selectedRoomRef.current) {
         setUnreadRooms((prev) =>
           prev.includes(data.roomId) ? prev : [...prev, data.roomId]
         );
@@ -87,24 +94,37 @@ export default function StaffChat() {
       });
 
     return () => {
+      if (typingTimeoutRef.current) {
+        clearTimeout(typingTimeoutRef.current);
+      }
+
       socket.off("activeRooms");
       socket.off("chatHistory");
       socket.off("receiveMessage");
       socket.off("newRoomMessage");
       socket.off("userTyping");
       socket.off("userStopTyping");
+      socket.disconnect();
     };
-  }, [selectedRoom]);
+  }, []);
 
-  const openRoom = (roomId: string) => {
-    setSelectedRoom(roomId);
-    setUnreadRooms((prev) => prev.filter((room) => room !== roomId));
+    const openRoom = (roomId: string) => {
+      setSelectedRoom(roomId);
 
-    socket.emit("joinRoom", {
-      roomId,
-      userType: currentUser
-    });
-  };
+      setUnreadRooms((prev) =>
+        prev.filter((room) => room !== roomId)
+      );
+
+      setRoomStatus((prev) => ({
+        ...prev,
+        [roomId]: "active"
+      }));
+
+      socket.emit("joinRoom", {
+        roomId,
+        userType: currentUser
+      });
+    };
 
   const sendMessage = () => {
     if (!message.trim() || !selectedRoom) return;
@@ -268,32 +288,67 @@ export default function StaffChat() {
                   }}
                 >
                   <div
-                    style={{
-                      display: "flex",
-                      justifyContent: "space-between",
-                      alignItems: "center",
-                      gap: 10
-                    }}
-                  >
-                    <span>Suite {room.replace("room-", "")}</span>
+  style={{
+    display: "flex",
+    justifyContent: "space-between",
+    alignItems: "flex-start",
+    gap: 10
+  }}
+>
+          <div
+            style={{
+              display: "flex",
+              flexDirection: "column",
+              gap: 4
+            }}
+          >
+            <span>
+              Suite {room.replace("room-", "")}
+            </span>
 
-                    {hasUnread && (
-                      <span
-                        style={{
-                          color: isSelected
-                            ? "#2B241C"
-                            : darkMode
-                            ? "#E5D3A1"
-                            : "#C8A96A",
-                          fontSize: 12,
-                          fontWeight: 900,
-                          whiteSpace: "nowrap"
-                        }}
-                      >
-                        ● Nuevo
-                      </span>
-                    )}
-                  </div>
+            <span
+              style={{
+                fontSize: 11,
+                fontWeight: 800,
+                color:
+                  roomStatus[room] === "active"
+                    ? "#22c55e"
+                    : roomStatus[room] === "resolved"
+                    ? darkMode
+                      ? "#CBD5E1"
+                      : "#64748B"
+                    : isSelected
+                    ? "#2B241C"
+                    : darkMode
+                    ? "#E5D3A1"
+                    : "#B08968"
+              }}
+            >
+              {roomStatus[room] === "active"
+                ? "● En atención"
+                : roomStatus[room] === "resolved"
+                ? "✓ Resuelto"
+                : "○ Esperando"}
+            </span>
+          </div>
+
+          {hasUnread && (
+            <span
+              style={{
+                color: isSelected
+                  ? "#2B241C"
+                  : darkMode
+                  ? "#E5D3A1"
+                  : "#C8A96A",
+                fontSize: 12,
+                fontWeight: 900,
+                whiteSpace: "nowrap"
+              }}
+            >
+              ● Nuevo
+            </span>
+          )}
+        </div>
                 </button>
               );
             })}
@@ -332,7 +387,69 @@ export default function StaffChat() {
           >
             Atención personalizada al huésped
           </p>
+          {selectedRoom && (
+            <div style={{ display: "flex", gap: 10, marginBottom: 20 }}>
+              <button
+                onClick={() =>
+                  setRoomStatus((prev) => ({
+                    ...prev,
+                    [selectedRoom]: "active"
+                  }))
+                }
+                style={{
+                  padding: "10px 16px",
+                  borderRadius: 14,
+                  border: "none",
+                  cursor: "pointer",
+                  fontWeight: 700,
+                  background: "#22c55e",
+                  color: "#fff"
+                }}
+              >
+                En atención
+              </button>
 
+              <button
+                onClick={() =>
+                  setRoomStatus((prev) => ({
+                    ...prev,
+                    [selectedRoom]: "resolved"
+                  }))
+                }
+                style={{
+                  padding: "10px 16px",
+                  borderRadius: 14,
+                  border: "none",
+                  cursor: "pointer",
+                  fontWeight: 700,
+                  background: "#94A3B8",
+                  color: "#fff"
+                }}
+              >
+                Resuelto
+              </button>
+
+              <button
+                onClick={() =>
+                  setRoomStatus((prev) => ({
+                    ...prev,
+                    [selectedRoom]: "waiting"
+                  }))
+                }
+                style={{
+                  padding: "10px 16px",
+                  borderRadius: 14,
+                  border: "none",
+                  cursor: "pointer",
+                  fontWeight: 700,
+                  background: "#C8A96A",
+                  color: "#2B241C"
+                }}
+              >
+                Reabrir
+              </button>
+            </div>
+          )}
           <div
             ref={messagesContainerRef}
             style={{
@@ -440,37 +557,65 @@ export default function StaffChat() {
                 </div>
               );
             })}
+        {isTyping && (
+          <div
+            style={{
+              display: "flex",
+              justifyContent: "flex-start",
+              marginBottom: 18,
+              animation: "fadeIn 0.2s ease"
+            }}
+          >
+            <div
+              style={{
+                maxWidth: 220,
+                padding: "16px 18px",
+                borderRadius: 24,
+                background: darkMode
+                  ? "linear-gradient(135deg, #2A241F 0%, #1E1A17 100%)"
+                  : "linear-gradient(135deg, #FFFFFF 0%, #F7F2E8 100%)",
+                border: darkMode
+                  ? "1px solid rgba(216,199,168,0.10)"
+                  : "1px solid rgba(200,169,106,0.12)",
+                boxShadow: darkMode
+                  ? "0 12px 34px rgba(0,0,0,0.28)"
+                  : "0 10px 30px rgba(90,70,40,0.06)"
+              }}
+            >
+              <div
+                style={{
+                  fontSize: 12,
+                  color: darkMode ? "#CDBFAD" : "#7A6A58",
+                  marginBottom: 6,
+                  fontWeight: 700
+                }}
+              >
+                Guest
+              </div>
 
-            {isTyping && (
               <div
                 style={{
                   display: "flex",
-                  justifyContent: "flex-start",
-                  marginBottom: 18
+                  alignItems: "center",
+                  gap: 6,
+                  color: darkMode ? "#F5EAD7" : "#7A6A58",
+                  fontSize: 15,
+                  fontStyle: "italic"
                 }}
               >
-                <div
+                typing...
+
+                <span
                   style={{
-                    padding: "14px 18px",
-                    borderRadius: 24,
-                    background: darkMode
-                      ? "linear-gradient(135deg, #2A241F 0%, #1E1A17 100%)"
-                      : "linear-gradient(135deg, #FFFFFF 0%, #F7F2E8 100%)",
-                    border: darkMode
-                      ? "1px solid rgba(216,199,168,0.10)"
-                      : "1px solid rgba(200,169,106,0.12)",
-                    color: darkMode ? "#CDBFAD" : "#7A6A58",
-                    fontSize: 14,
-                    fontStyle: "italic",
-                    boxShadow: darkMode
-                      ? "0 12px 34px rgba(0,0,0,0.28)"
-                      : "0 10px 30px rgba(90,70,40,0.06)"
+                    animation: "blink 1s infinite"
                   }}
                 >
-                  Guest is typing...
-                </div>
+                  ●
+                </span>
               </div>
-            )}
+            </div>
+          </div>
+        )}
           </div>
 
           <div
