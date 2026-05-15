@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Cormorant_Garamond } from "next/font/google";
 import { socket } from "@/lib/socket";
 
@@ -42,6 +42,29 @@ const statusConfig: Record<string, { label: string; color: string }> = {
   offline: { label: "Offline", color: "#57534E" }
 };
 
+function normalizeRoomId(roomId: string) {
+  return `room-${roomId.replace(/^room-/, "")}`;
+}
+
+function dedupeSuites(nextSuites: Suite[]) {
+  return Array.from(
+    nextSuites
+      .reduce((acc, suite) => {
+        const roomId = normalizeRoomId(suite.roomId || suite.suiteId);
+        const suiteId = roomId.replace(/^room-/, "");
+
+        acc.set(suiteId, {
+          ...suite,
+          suiteId,
+          roomId
+        });
+
+        return acc;
+      }, new Map<string, Suite>())
+      .values()
+  );
+}
+
 export default function StaffChat() {
   const currentUser = "staff";
 
@@ -59,12 +82,41 @@ export default function StaffChat() {
   const selectedRoomRef = useRef<string | null>(null);
 
   const selectedSuite = suites.find((suite) => suite.roomId === selectedRoom);
+  const dashboardMetrics = useMemo(() => {
+    return suites.reduce(
+      (metrics, suite) => {
+        if (suite.status === "active") {
+          metrics.active += 1;
+        }
+
+        if (suite.status === "pending") {
+          metrics.pending += 1;
+        }
+
+        if (suite.status === "waiting") {
+          metrics.waiting += 1;
+        }
+
+        if (suite.vip) {
+          metrics.vip += 1;
+        }
+
+        return metrics;
+      },
+      {
+        active: 0,
+        pending: 0,
+        waiting: 0,
+        vip: 0
+      }
+    );
+  }, [suites]);
 
   const fetchQueue = async () => {
     const response = await fetch(`${API_URL}/suites/queue`);
     const data = await response.json();
 
-    setSuites(data.suites || []);
+    setSuites(dedupeSuites(data.suites || []));
   };
 
   useEffect(() => {
@@ -83,7 +135,7 @@ export default function StaffChat() {
     });
 
     socket.on("queueUpdated", (updatedSuites: Suite[]) => {
-      setSuites(updatedSuites);
+      setSuites(dedupeSuites(updatedSuites));
     });
 
     socket.on("chatHistory", (history: Message[]) => {
@@ -182,8 +234,10 @@ export default function StaffChat() {
       const updatedSuite = await response.json();
 
       setSuites((prev) =>
-        prev.map((suite) =>
-          suite.roomId === roomId ? { ...suite, ...updatedSuite } : suite
+        dedupeSuites(
+          prev.map((suite) =>
+            suite.roomId === roomId ? { ...suite, ...updatedSuite } : suite
+          )
         )
       );
     } catch (error) {
@@ -262,6 +316,15 @@ export default function StaffChat() {
           : "radial-gradient(circle at top left, rgba(200,169,106,0.28), transparent 28%), linear-gradient(135deg, #FFFDF8 0%, #F7F2E8 45%, #E8DCC8 100%)"
       }}
     >
+      <style>
+        {`
+          @keyframes hconnectQueuePulse {
+            0% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.46); }
+            70% { box-shadow: 0 0 0 8px rgba(239, 68, 68, 0); }
+            100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0); }
+          }
+        `}
+      </style>
       <section
         style={{
           width: "100%",
@@ -344,6 +407,59 @@ export default function StaffChat() {
 
           <div
             style={{
+              display: "grid",
+              gridTemplateColumns: "1fr 1fr",
+              gap: 10,
+              marginBottom: 24
+            }}
+          >
+            {[
+              { label: "Activas", value: dashboardMetrics.active, color: "#22C55E" },
+              { label: "Pendientes", value: dashboardMetrics.pending, color: "#F97316" },
+              { label: "Waiting", value: dashboardMetrics.waiting, color: "#F59E0B" },
+              { label: "VIP", value: dashboardMetrics.vip, color: "#C8A96A" }
+            ].map((metric) => (
+              <div
+                key={metric.label}
+                style={{
+                  padding: "12px 14px",
+                  borderRadius: 14,
+                  background: darkMode ? "rgba(42,36,31,0.72)" : "#FFFDF8",
+                  border: darkMode
+                    ? "1px solid rgba(216,199,168,0.14)"
+                    : "1px solid rgba(200,169,106,0.18)",
+                  boxShadow: darkMode
+                    ? "0 8px 24px rgba(0,0,0,0.18)"
+                    : "0 8px 20px rgba(90,70,40,0.06)"
+                }}
+              >
+                <div
+                  style={{
+                    fontSize: 10,
+                    fontWeight: 900,
+                    color: darkMode ? "#B8A88F" : "#7A6A58",
+                    textTransform: "uppercase"
+                  }}
+                >
+                  {metric.label}
+                </div>
+                <div
+                  style={{
+                    marginTop: 4,
+                    fontSize: 24,
+                    lineHeight: 1,
+                    fontWeight: 900,
+                    color: metric.color
+                  }}
+                >
+                  {metric.value}
+                </div>
+              </div>
+            ))}
+          </div>
+
+          <div
+            style={{
               display: "flex",
               flexDirection: "column",
               gap: 16
@@ -359,7 +475,7 @@ export default function StaffChat() {
 
               return (
                 <button
-                  key={room}
+                  key={suite.suiteId}
                   onClick={() => openRoom(room, suite.status)}
                   style={{
                     padding: "20px 22px",
@@ -390,7 +506,10 @@ export default function StaffChat() {
                         ? "0 10px 34px rgba(200,169,106,0.24)"
                         : "0 10px 30px rgba(200,169,106,0.22)"
                       : hasUnread
-                      ? "0 0 0 2px rgba(200,169,106,0.32)"
+                      ? "0 0 0 2px rgba(239,68,68,0.34), 0 12px 34px rgba(239,68,68,0.18)"
+                      : "none",
+                    animation: hasUnread && !isSelected
+                      ? "hconnectQueuePulse 1.8s infinite"
                       : "none"
                   }}
                 >
@@ -442,11 +561,19 @@ export default function StaffChat() {
                 color: isSelected
                   ? "#2B241C"
                   : darkMode
-                  ? "#E5D3A1"
-                  : "#C8A96A",
+                  ? "#FEE2E2"
+                  : "#7F1D1D",
                 fontSize: 12,
                 fontWeight: 900,
-                whiteSpace: "nowrap"
+                whiteSpace: "nowrap",
+                padding: "4px 8px",
+                borderRadius: 999,
+                background: isSelected
+                  ? "rgba(43,36,28,0.10)"
+                  : "rgba(239,68,68,0.16)",
+                border: isSelected
+                  ? "1px solid rgba(43,36,28,0.12)"
+                  : "1px solid rgba(239,68,68,0.32)"
               }}
             >
               {suite.vip ? "VIP" : "Nuevo"}
