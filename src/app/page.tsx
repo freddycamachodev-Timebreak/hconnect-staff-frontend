@@ -1,15 +1,15 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
-import { io } from "socket.io-client";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Cormorant_Garamond } from "next/font/google";
+import { socket } from "@/lib/socket";
 
 const cormorant = Cormorant_Garamond({
   subsets: ["latin"],
   weight: ["400", "500", "600"]
 });
 
-const socket = io("http://localhost:4000");
+const API_URL = "http://localhost:4000";
 
 type Message = {
   id?: string;
@@ -21,24 +21,121 @@ type Message = {
   timestamp: string;
 };
 
+type Suite = {
+  suiteId: string;
+  roomId: string;
+  status: string;
+  updatedBy: string | null;
+  updatedAt: string | null;
+  priority: string;
+  vip: boolean;
+  lastMessageAt: string | null;
+  unresolvedCount: number;
+};
+
+const statusConfig: Record<string, { label: string; color: string }> = {
+  waiting: { label: "Waiting", color: "#F59E0B" },
+  active: { label: "Active", color: "#22C55E" },
+  pending: { label: "Pending", color: "#F97316" },
+  resolved: { label: "Resolved", color: "#94A3B8" },
+  checkout: { label: "Checkout", color: "#64748B" },
+  offline: { label: "Offline", color: "#57534E" }
+};
+
+function normalizeRoomId(roomId: string) {
+  return `room-${roomId.replace(/^room-/, "")}`;
+}
+
+function dedupeSuites(nextSuites: Suite[]) {
+  return Array.from(
+    nextSuites
+      .reduce((acc, suite) => {
+        const roomId = normalizeRoomId(suite.roomId || suite.suiteId);
+        const suiteId = roomId.replace(/^room-/, "");
+
+        acc.set(suiteId, {
+          ...suite,
+          suiteId,
+          roomId
+        });
+
+        return acc;
+      }, new Map<string, Suite>())
+      .values()
+  );
+}
+
 export default function StaffChat() {
   const currentUser = "staff";
 
   const [message, setMessage] = useState("");
   const [messages, setMessages] = useState<Message[]>([]);
-  const [rooms, setRooms] = useState<string[]>([]);
+  const [suites, setSuites] = useState<Suite[]>([]);
   const [selectedRoom, setSelectedRoom] = useState<string | null>(null);
   const [unreadRooms, setUnreadRooms] = useState<string[]>([]);
   const [darkMode, setDarkMode] = useState(false);
   const [isTyping, setIsTyping] = useState(false);
-
+  const [currentTime, setCurrentTime] = useState(0);
 
   const messagesContainerRef = useRef<HTMLDivElement | null>(null);
   const typingTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const selectedRoomRef = useRef<string | null>(null);
+
+  const selectedSuite = suites.find((suite) => suite.roomId === selectedRoom);
+  const dashboardMetrics = useMemo(() => {
+    return suites.reduce(
+      (metrics, suite) => {
+        if (suite.status === "active") {
+          metrics.active += 1;
+        }
+
+        if (suite.status === "pending") {
+          metrics.pending += 1;
+        }
+
+        if (suite.status === "waiting") {
+          metrics.waiting += 1;
+        }
+
+        if (suite.vip) {
+          metrics.vip += 1;
+        }
+
+        return metrics;
+      },
+      {
+        active: 0,
+        pending: 0,
+        waiting: 0,
+        vip: 0
+      }
+    );
+  }, [suites]);
+
+  const fetchQueue = async () => {
+    const response = await fetch(`${API_URL}/suites/queue`);
+    const data = await response.json();
+
+    setSuites(dedupeSuites(data.suites || []));
+  };
 
   useEffect(() => {
-    socket.on("activeRooms", (activeRooms: string[]) => {
-      setRooms(activeRooms);
+    selectedRoomRef.current = selectedRoom;
+  }, [selectedRoom]);
+
+  useEffect(() => {
+    if (!socket.connected) {
+      socket.connect();
+    }
+
+    socket.on("activeRooms", () => {
+      fetchQueue().catch((error) => {
+        console.error("Error loading suite queue:", error);
+      });
+    });
+
+    socket.on("queueUpdated", (updatedSuites: Suite[]) => {
+      setSuites(dedupeSuites(updatedSuites));
     });
 
     socket.on("chatHistory", (history: Message[]) => {
@@ -53,7 +150,7 @@ export default function StaffChat() {
     });
 
     socket.on("receiveMessage", (data: Message) => {
-      if (data.roomId === selectedRoom) {
+      if (data.roomId === selectedRoomRef.current) {
         setMessages((prev) => [...prev, data]);
 
         setTimeout(() => {
@@ -66,7 +163,7 @@ export default function StaffChat() {
     });
 
     socket.on("newRoomMessage", (data: Message) => {
-      if (data.sender === "guest" && data.roomId !== selectedRoom) {
+      if (data.sender === "guest" && data.roomId !== selectedRoomRef.current) {
         setUnreadRooms((prev) =>
           prev.includes(data.roomId) ? prev : [...prev, data.roomId]
         );
@@ -80,31 +177,90 @@ export default function StaffChat() {
       setIsTyping(false);
     });
 
-    fetch("http://localhost:4000/rooms")
-      .then((res) => res.json())
-      .then((data) => {
-        setRooms(data.rooms || []);
+    const queueTimeoutId = window.setTimeout(() => {
+      fetchQueue().catch((error) => {
+        console.error("Error loading suite queue:", error);
       });
+    }, 0);
+
+    const clockTimeoutId = window.setTimeout(() => {
+      setCurrentTime(Date.now());
+    }, 0);
+
+    const clockIntervalId = window.setInterval(() => {
+      setCurrentTime(Date.now());
+    }, 60000);
 
     return () => {
+      if (typingTimeoutRef.current) {
+        clearTimeout(typingTimeoutRef.current);
+      }
+
+      window.clearTimeout(queueTimeoutId);
+      window.clearTimeout(clockTimeoutId);
+      window.clearInterval(clockIntervalId);
+
       socket.off("activeRooms");
+      socket.off("queueUpdated");
       socket.off("chatHistory");
       socket.off("receiveMessage");
       socket.off("newRoomMessage");
       socket.off("userTyping");
       socket.off("userStopTyping");
+      socket.disconnect();
     };
-  }, [selectedRoom]);
+  }, []);
 
-  const openRoom = (roomId: string) => {
-    setSelectedRoom(roomId);
-    setUnreadRooms((prev) => prev.filter((room) => room !== roomId));
+  const updateSuiteStatus = async (roomId: string, status: string) => {
+    const suiteId = roomId.replace(/^room-/, "");
 
-    socket.emit("joinRoom", {
-      roomId,
-      userType: currentUser
-    });
+    try {
+      const response = await fetch(`${API_URL}/suites/${suiteId}/status`, {
+        method: "PUT",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          status,
+          roomId,
+          updatedBy: currentUser
+        })
+      });
+
+      if (!response.ok) {
+        throw new Error("Suite status update failed");
+      }
+
+      const updatedSuite = await response.json();
+
+      setSuites((prev) =>
+        dedupeSuites(
+          prev.map((suite) =>
+            suite.roomId === roomId ? { ...suite, ...updatedSuite } : suite
+          )
+        )
+      );
+    } catch (error) {
+      console.error("Error updating suite status:", error);
+    }
   };
+
+    const openRoom = (roomId: string, currentStatus?: string) => {
+      setSelectedRoom(roomId);
+
+      setUnreadRooms((prev) =>
+        prev.filter((room) => room !== roomId)
+      );
+
+      socket.emit("joinRoom", {
+        roomId,
+        userType: currentUser
+      });
+
+      if (currentStatus === "waiting" || currentStatus === "pending") {
+        updateSuiteStatus(roomId, "active");
+      }
+    };
 
   const sendMessage = () => {
     if (!message.trim() || !selectedRoom) return;
@@ -125,6 +281,27 @@ export default function StaffChat() {
     });
   };
 
+  const formatRelativeTime = (timestamp: string | null) => {
+    if (!timestamp) {
+      return "Sin actividad";
+    }
+
+    const diffMinutes = Math.max(
+      0,
+      Math.floor((currentTime - new Date(timestamp).getTime()) / 60000)
+    );
+
+    if (diffMinutes < 1) {
+      return "Ahora";
+    }
+
+    if (diffMinutes < 60) {
+      return `Hace ${diffMinutes} min`;
+    }
+
+    return `Hace ${Math.floor(diffMinutes / 60)} h`;
+  };
+
   return (
     <main
       style={{
@@ -139,6 +316,15 @@ export default function StaffChat() {
           : "radial-gradient(circle at top left, rgba(200,169,106,0.28), transparent 28%), linear-gradient(135deg, #FFFDF8 0%, #F7F2E8 45%, #E8DCC8 100%)"
       }}
     >
+      <style>
+        {`
+          @keyframes hconnectQueuePulse {
+            0% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.46); }
+            70% { box-shadow: 0 0 0 8px rgba(239, 68, 68, 0); }
+            100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0); }
+          }
+        `}
+      </style>
       <section
         style={{
           width: "100%",
@@ -221,19 +407,76 @@ export default function StaffChat() {
 
           <div
             style={{
+              display: "grid",
+              gridTemplateColumns: "1fr 1fr",
+              gap: 10,
+              marginBottom: 24
+            }}
+          >
+            {[
+              { label: "Activas", value: dashboardMetrics.active, color: "#22C55E" },
+              { label: "Pendientes", value: dashboardMetrics.pending, color: "#F97316" },
+              { label: "Waiting", value: dashboardMetrics.waiting, color: "#F59E0B" },
+              { label: "VIP", value: dashboardMetrics.vip, color: "#C8A96A" }
+            ].map((metric) => (
+              <div
+                key={metric.label}
+                style={{
+                  padding: "12px 14px",
+                  borderRadius: 14,
+                  background: darkMode ? "rgba(42,36,31,0.72)" : "#FFFDF8",
+                  border: darkMode
+                    ? "1px solid rgba(216,199,168,0.14)"
+                    : "1px solid rgba(200,169,106,0.18)",
+                  boxShadow: darkMode
+                    ? "0 8px 24px rgba(0,0,0,0.18)"
+                    : "0 8px 20px rgba(90,70,40,0.06)"
+                }}
+              >
+                <div
+                  style={{
+                    fontSize: 10,
+                    fontWeight: 900,
+                    color: darkMode ? "#B8A88F" : "#7A6A58",
+                    textTransform: "uppercase"
+                  }}
+                >
+                  {metric.label}
+                </div>
+                <div
+                  style={{
+                    marginTop: 4,
+                    fontSize: 24,
+                    lineHeight: 1,
+                    fontWeight: 900,
+                    color: metric.color
+                  }}
+                >
+                  {metric.value}
+                </div>
+              </div>
+            ))}
+          </div>
+
+          <div
+            style={{
               display: "flex",
               flexDirection: "column",
               gap: 16
             }}
           >
-            {rooms.map((room) => {
+            {suites.map((suite) => {
+              const room = suite.roomId;
               const isSelected = selectedRoom === room;
-              const hasUnread = unreadRooms.includes(room);
+              const hasUnread =
+                unreadRooms.includes(room) || suite.unresolvedCount > 0;
+              const operationalStatus =
+                statusConfig[suite.status] || statusConfig.waiting;
 
               return (
                 <button
-                  key={room}
-                  onClick={() => openRoom(room)}
+                  key={suite.suiteId}
+                  onClick={() => openRoom(room, suite.status)}
                   style={{
                     padding: "20px 22px",
                     borderRadius: 20,
@@ -263,37 +506,120 @@ export default function StaffChat() {
                         ? "0 10px 34px rgba(200,169,106,0.24)"
                         : "0 10px 30px rgba(200,169,106,0.22)"
                       : hasUnread
-                      ? "0 0 0 2px rgba(200,169,106,0.32)"
+                      ? "0 0 0 2px rgba(239,68,68,0.34), 0 12px 34px rgba(239,68,68,0.18)"
+                      : "none",
+                    animation: hasUnread && !isSelected
+                      ? "hconnectQueuePulse 1.8s infinite"
                       : "none"
                   }}
                 >
                   <div
-                    style={{
-                      display: "flex",
-                      justifyContent: "space-between",
-                      alignItems: "center",
-                      gap: 10
-                    }}
-                  >
-                    <span>Suite {room.replace("room-", "")}</span>
+  style={{
+    display: "flex",
+    justifyContent: "space-between",
+    alignItems: "flex-start",
+    gap: 10
+  }}
+>
+          <div
+            style={{
+              display: "flex",
+              flexDirection: "column",
+              gap: 4
+            }}
+          >
+            <span>
+              Suite {room.replace("room-", "")}
+            </span>
 
-                    {hasUnread && (
-                      <span
-                        style={{
-                          color: isSelected
-                            ? "#2B241C"
-                            : darkMode
-                            ? "#E5D3A1"
-                            : "#C8A96A",
-                          fontSize: 12,
-                          fontWeight: 900,
-                          whiteSpace: "nowrap"
-                        }}
-                      >
-                        ● Nuevo
-                      </span>
-                    )}
-                  </div>
+            <span
+              style={{
+                fontSize: 11,
+                fontWeight: 800,
+                color: isSelected ? "#2B241C" : operationalStatus.color
+              }}
+            >
+              {suite.status === "active"
+                ? "● En atención"
+                : suite.status === "resolved"
+                ? "✓ Resuelto"
+                : "○ Esperando"}
+            </span>
+          </div>
+
+          <div
+            style={{
+              display: "flex",
+              flexDirection: "column",
+              alignItems: "flex-end",
+              gap: 5
+            }}
+          >
+          {(hasUnread || suite.vip) && (
+            <span
+              style={{
+                color: isSelected
+                  ? "#2B241C"
+                  : darkMode
+                  ? "#FEE2E2"
+                  : "#7F1D1D",
+                fontSize: 12,
+                fontWeight: 900,
+                whiteSpace: "nowrap",
+                padding: "4px 8px",
+                borderRadius: 999,
+                background: isSelected
+                  ? "rgba(43,36,28,0.10)"
+                  : "rgba(239,68,68,0.16)",
+                border: isSelected
+                  ? "1px solid rgba(43,36,28,0.12)"
+                  : "1px solid rgba(239,68,68,0.32)"
+              }}
+            >
+              {suite.vip ? "VIP" : "Nuevo"}
+            </span>
+          )}
+            <span
+              style={{
+                color: isSelected ? "#2B241C" : operationalStatus.color,
+                fontSize: 11,
+                fontWeight: 900,
+                whiteSpace: "nowrap"
+              }}
+            >
+              {operationalStatus.label}
+            </span>
+            <span
+              style={{
+                color: isSelected
+                  ? "#2B241C"
+                  : darkMode
+                  ? "#B8A88F"
+                  : "#7A6A58",
+                fontSize: 11,
+                fontWeight: 800,
+                whiteSpace: "nowrap"
+              }}
+            >
+              {suite.unresolvedCount} pendientes
+            </span>
+
+            <span
+              style={{
+                color: isSelected
+                  ? "#2B241C"
+                  : darkMode
+                  ? "#9B8A75"
+                  : "#8A7A66",
+                fontSize: 11,
+                fontWeight: 700,
+                whiteSpace: "nowrap"
+              }}
+            >
+              {formatRelativeTime(suite.lastMessageAt)}
+            </span>
+          </div>
+        </div>
                 </button>
               );
             })}
@@ -332,7 +658,74 @@ export default function StaffChat() {
           >
             Atención personalizada al huésped
           </p>
+          {selectedSuite && (
+            <div
+              style={{
+                display: "flex",
+                gap: 12,
+                alignItems: "center",
+                marginBottom: 18,
+                color: darkMode ? "#CDBFAD" : "#7A6A58",
+                fontSize: 13,
+                fontWeight: 800
+              }}
+            >
+              <span style={{ color: statusConfig[selectedSuite.status]?.color }}>
+                {statusConfig[selectedSuite.status]?.label || selectedSuite.status}
+              </span>
+              <span>{selectedSuite.unresolvedCount} pendientes</span>
+              <span>{formatRelativeTime(selectedSuite.lastMessageAt)}</span>
+              {selectedSuite.vip && <span>VIP</span>}
+            </div>
+          )}
+          {selectedRoom && (
+            <div style={{ display: "flex", gap: 10, marginBottom: 20 }}>
+              <button
+                onClick={() => updateSuiteStatus(selectedRoom, "active")}
+                style={{
+                  padding: "10px 16px",
+                  borderRadius: 14,
+                  border: "none",
+                  cursor: "pointer",
+                  fontWeight: 700,
+                  background: "#22c55e",
+                  color: "#fff"
+                }}
+              >
+                En atención
+              </button>
 
+              <button
+                onClick={() => updateSuiteStatus(selectedRoom, "resolved")}
+                style={{
+                  padding: "10px 16px",
+                  borderRadius: 14,
+                  border: "none",
+                  cursor: "pointer",
+                  fontWeight: 700,
+                  background: "#94A3B8",
+                  color: "#fff"
+                }}
+              >
+                Resuelto
+              </button>
+
+              <button
+                onClick={() => updateSuiteStatus(selectedRoom, "waiting")}
+                style={{
+                  padding: "10px 16px",
+                  borderRadius: 14,
+                  border: "none",
+                  cursor: "pointer",
+                  fontWeight: 700,
+                  background: "#C8A96A",
+                  color: "#2B241C"
+                }}
+              >
+                Reabrir
+              </button>
+            </div>
+          )}
           <div
             ref={messagesContainerRef}
             style={{
@@ -440,37 +833,65 @@ export default function StaffChat() {
                 </div>
               );
             })}
+        {isTyping && (
+          <div
+            style={{
+              display: "flex",
+              justifyContent: "flex-start",
+              marginBottom: 18,
+              animation: "fadeIn 0.2s ease"
+            }}
+          >
+            <div
+              style={{
+                maxWidth: 220,
+                padding: "16px 18px",
+                borderRadius: 24,
+                background: darkMode
+                  ? "linear-gradient(135deg, #2A241F 0%, #1E1A17 100%)"
+                  : "linear-gradient(135deg, #FFFFFF 0%, #F7F2E8 100%)",
+                border: darkMode
+                  ? "1px solid rgba(216,199,168,0.10)"
+                  : "1px solid rgba(200,169,106,0.12)",
+                boxShadow: darkMode
+                  ? "0 12px 34px rgba(0,0,0,0.28)"
+                  : "0 10px 30px rgba(90,70,40,0.06)"
+              }}
+            >
+              <div
+                style={{
+                  fontSize: 12,
+                  color: darkMode ? "#CDBFAD" : "#7A6A58",
+                  marginBottom: 6,
+                  fontWeight: 700
+                }}
+              >
+                Guest
+              </div>
 
-            {isTyping && (
               <div
                 style={{
                   display: "flex",
-                  justifyContent: "flex-start",
-                  marginBottom: 18
+                  alignItems: "center",
+                  gap: 6,
+                  color: darkMode ? "#F5EAD7" : "#7A6A58",
+                  fontSize: 15,
+                  fontStyle: "italic"
                 }}
               >
-                <div
+                typing...
+
+                <span
                   style={{
-                    padding: "14px 18px",
-                    borderRadius: 24,
-                    background: darkMode
-                      ? "linear-gradient(135deg, #2A241F 0%, #1E1A17 100%)"
-                      : "linear-gradient(135deg, #FFFFFF 0%, #F7F2E8 100%)",
-                    border: darkMode
-                      ? "1px solid rgba(216,199,168,0.10)"
-                      : "1px solid rgba(200,169,106,0.12)",
-                    color: darkMode ? "#CDBFAD" : "#7A6A58",
-                    fontSize: 14,
-                    fontStyle: "italic",
-                    boxShadow: darkMode
-                      ? "0 12px 34px rgba(0,0,0,0.28)"
-                      : "0 10px 30px rgba(90,70,40,0.06)"
+                    animation: "blink 1s infinite"
                   }}
                 >
-                  Guest is typing...
-                </div>
+                  ●
+                </span>
               </div>
-            )}
+            </div>
+          </div>
+        )}
           </div>
 
           <div
