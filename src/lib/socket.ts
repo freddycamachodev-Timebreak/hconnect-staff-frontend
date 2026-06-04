@@ -1,4 +1,5 @@
 import { io } from "socket.io-client";
+import { API_URL } from "@/lib/api";
 
 function getClientId() {
   if (typeof window === "undefined") {
@@ -18,7 +19,7 @@ function getClientId() {
   return clientId;
 }
 
-export const socket = io("http://localhost:4000", {
+export const socket = io(API_URL, {
   autoConnect: false,
   auth: (callback) => {
     callback({

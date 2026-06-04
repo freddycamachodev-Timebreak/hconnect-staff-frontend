@@ -3,13 +3,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Cormorant_Garamond } from "next/font/google";
 import { socket } from "@/lib/socket";
+import { API_URL, readJsonResponse } from "@/lib/api";
 
 const cormorant = Cormorant_Garamond({
   subsets: ["latin"],
   weight: ["400", "500", "600"]
 });
-
-const API_URL = "http://localhost:4000";
 
 type Message = {
   id?: string;
@@ -31,6 +30,11 @@ type Suite = {
   vip: boolean;
   lastMessageAt: string | null;
   unresolvedCount: number;
+};
+
+type SuiteQueueResponse = {
+  suites?: Suite[];
+  rooms?: string[];
 };
 
 const statusConfig: Record<string, { label: string; color: string }> = {
@@ -142,6 +146,36 @@ function dedupeSuites(nextSuites: Suite[]) {
   return sortSuites(uniqueSuites);
 }
 
+function roomIdsToSuites(roomIds: string[]) {
+  return roomIds.map((roomId) => {
+    const normalizedRoomId = normalizeRoomId(roomId);
+
+    return {
+      suiteId: normalizedRoomId.replace(/^room-/, ""),
+      roomId: normalizedRoomId,
+      status: "waiting",
+      updatedBy: null,
+      updatedAt: null,
+      priority: "normal",
+      vip: false,
+      lastMessageAt: null,
+      unresolvedCount: 0
+    };
+  });
+}
+
+function getSuitesFromQueueResponse(data: SuiteQueueResponse) {
+  if (data.suites) {
+    return data.suites;
+  }
+
+  if (data.rooms) {
+    return roomIdsToSuites(data.rooms);
+  }
+
+  return [];
+}
+
 function getSlaState(suite: Suite, currentTime: number) {
   if (suite.unresolvedCount <= 0) {
     return {
@@ -210,6 +244,7 @@ export default function StaffChat() {
   const [darkMode, setDarkMode] = useState(false);
   const [isTyping, setIsTyping] = useState(false);
   const [currentTime, setCurrentTime] = useState(() => Date.now());
+  const targetLanguage = "en";
 
   const messagesContainerRef = useRef<HTMLDivElement | null>(null);
   const typingTimeoutRef = useRef<NodeJS.Timeout | null>(null);
@@ -375,10 +410,13 @@ export default function StaffChat() {
   }, [highlightSuite]);
 
   const fetchQueue = useCallback(async () => {
-    const response = await fetch(`${API_URL}/suites/queue`);
-    const data = await response.json();
+    const response = await fetch(`${API_URL}/rooms`);
+    const data = await readJsonResponse<SuiteQueueResponse>(
+      response,
+      "Suite queue request"
+    );
 
-    syncQueue(data.suites || []);
+    syncQueue(getSuitesFromQueueResponse(data));
   }, [syncQueue]);
 
   useEffect(() => {
@@ -390,10 +428,8 @@ export default function StaffChat() {
       socket.connect();
     }
 
-    socket.on("activeRooms", () => {
-      fetchQueue().catch((error) => {
-        console.error("Error loading suite queue:", error);
-      });
+    socket.on("activeRooms", (activeRooms: string[]) => {
+      syncQueue(roomIdsToSuites(activeRooms));
     });
 
     socket.on("queueUpdated", (updatedSuites: Suite[]) => {
@@ -484,79 +520,38 @@ export default function StaffChat() {
     };
   }, [fetchQueue, highlightSuite, syncQueue]);
 
-  const updateSuiteStatus = async (roomId: string, status: string) => {
-    const suiteId = roomId.replace(/^room-/, "");
-
-    try {
-      const response = await fetch(`${API_URL}/suites/${suiteId}/status`, {
-        method: "PUT",
-        headers: {
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
-          status,
-          roomId,
-          updatedBy: currentUser
-        })
-      });
-
-      if (!response.ok) {
-        throw new Error("Suite status update failed");
-      }
-
-      const updatedSuite = await response.json();
-
-      setSuites((prev) =>
-        dedupeSuites(
-          prev.map((suite) =>
-            suite.roomId === roomId ? { ...suite, ...updatedSuite } : suite
-          )
+  const updateSuiteStatus = (roomId: string, status: string) => {
+    setSuites((prev) =>
+      dedupeSuites(
+        prev.map((suite) =>
+          suite.roomId === roomId
+            ? {
+                ...suite,
+                status,
+                updatedBy: currentUser,
+                updatedAt: new Date().toISOString()
+              }
+            : suite
         )
-      );
-    } catch (error) {
-      console.error("Error updating suite status:", error);
-    }
+      )
+    );
   };
 
-  const updateSuiteVip = async (roomId: string, vip: boolean) => {
-    const currentSuite = suites.find((suite) => suite.roomId === roomId);
-
-    if (!currentSuite) {
-      return;
-    }
-
-    const suiteId = roomId.replace(/^room-/, "");
-
-    try {
-      const response = await fetch(`${API_URL}/suites/${suiteId}/status`, {
-        method: "PUT",
-        headers: {
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
-          status: currentSuite.status,
-          roomId,
-          updatedBy: currentUser,
-          vip
-        })
-      });
-
-      if (!response.ok) {
-        throw new Error("Suite VIP update failed");
-      }
-
-      const updatedSuite = await response.json();
-
-      setSuites((prev) =>
-        dedupeSuites(
-          prev.map((suite) =>
-            suite.roomId === roomId ? { ...suite, ...updatedSuite } : suite
-          )
+  const updateSuiteVip = (roomId: string, vip: boolean) => {
+    setSuites((prev) =>
+      dedupeSuites(
+        prev.map((suite) =>
+          suite.roomId === roomId
+            ? {
+                ...suite,
+                vip,
+                updatedBy: currentUser,
+                updatedAt: new Date().toISOString()
+              }
+            : suite
         )
-      );
-    } catch (error) {
-      console.error("Error updating suite VIP:", error);
-    }
+      )
+    );
   };
 
     const openRoom = (roomId: string, currentStatus?: string) => {
@@ -594,7 +589,9 @@ export default function StaffChat() {
     socket.emit("sendMessage", {
       roomId: selectedRoom,
       sender: currentUser,
-      text: message
+      text: message,
+      sourceLanguage: "es",
+      targetLanguage
     });
 
     setMessage("");
@@ -630,6 +627,7 @@ export default function StaffChat() {
 
   return (
     <main
+      className="hconnect-page"
       style={{
         minHeight: "100vh",
         display: "flex",
@@ -670,6 +668,145 @@ export default function StaffChat() {
 
           .hconnect-suite-queue::-webkit-scrollbar-thumb:hover {
             background: rgba(122, 106, 88, 0.48);
+          }
+
+          .hconnect-chat-panel {
+            min-width: 0;
+          }
+
+          .hconnect-messages {
+            min-height: 280px;
+          }
+
+          .hconnect-status-actions,
+          .hconnect-room-meta,
+          .hconnect-composer {
+            display: flex;
+            flex-wrap: wrap;
+          }
+
+          .hconnect-message-input {
+            min-width: 220px;
+          }
+
+          @media (max-width: 900px) {
+            .hconnect-page {
+              align-items: stretch !important;
+              padding: 16px !important;
+            }
+
+            .hconnect-shell {
+              height: auto !important;
+              min-height: calc(100vh - 32px);
+              flex-direction: column;
+              border-radius: 24px !important;
+              overflow: visible !important;
+            }
+
+            .hconnect-sidebar {
+              width: 100% !important;
+              padding: 28px 22px !important;
+              overflow: visible !important;
+              border-right: none !important;
+              border-bottom: 1px solid rgba(200,169,106,0.20);
+            }
+
+            .hconnect-chat-panel {
+              padding: 24px 22px 28px !important;
+            }
+
+            .hconnect-room-title {
+              font-size: 44px !important;
+              line-height: 1 !important;
+            }
+
+            .hconnect-suite-queue {
+              max-height: 260px !important;
+            }
+
+            .hconnect-messages {
+              min-height: 360px;
+              max-height: 58vh;
+              padding: 18px !important;
+              border-radius: 22px !important;
+            }
+
+            .hconnect-message-bubble {
+              max-width: 82% !important;
+            }
+
+            .hconnect-composer {
+              gap: 12px !important;
+              margin-top: 18px !important;
+            }
+
+            .hconnect-language-select {
+              width: calc(45% - 6px) !important;
+              min-width: 0 !important;
+            }
+
+            .hconnect-message-input {
+              flex: 1 1 calc(55% - 6px) !important;
+              min-width: 0 !important;
+            }
+
+            .hconnect-send-button {
+              width: 100%;
+              min-height: 58px;
+              padding: 0 22px !important;
+            }
+          }
+
+          @media (max-width: 560px) {
+            .hconnect-page {
+              padding: 0 !important;
+            }
+
+            .hconnect-shell {
+              min-height: 100vh;
+              border-radius: 0 !important;
+              box-shadow: none !important;
+            }
+
+            .hconnect-sidebar {
+              padding: 24px 16px 18px !important;
+            }
+
+            .hconnect-chat-panel {
+              padding: 22px 16px 24px !important;
+            }
+
+            .hconnect-room-title {
+              font-size: 38px !important;
+            }
+
+            .hconnect-room-meta {
+              gap: 8px !important;
+              align-items: flex-start !important;
+            }
+
+            .hconnect-status-actions > button {
+              flex: 1 1 calc(50% - 5px);
+              min-height: 44px;
+              padding: 9px 10px !important;
+            }
+
+            .hconnect-messages {
+              min-height: 320px;
+              max-height: 56vh;
+            }
+
+            .hconnect-message-bubble {
+              max-width: 90% !important;
+              padding: 16px !important;
+              border-radius: 20px !important;
+            }
+
+            .hconnect-language-select,
+            .hconnect-message-input {
+              width: 100% !important;
+              flex: 1 1 100% !important;
+            }
           }
         `}
       </style>
@@ -722,6 +859,7 @@ export default function StaffChat() {
         </button>
       )}
       <section
+        className="hconnect-shell"
         style={{
           width: "100%",
           maxWidth: 1400,
@@ -741,6 +879,7 @@ export default function StaffChat() {
         }}
       >
         <aside
+          className="hconnect-sidebar"
           style={{
             width: 360,
             padding: 30,
@@ -1105,6 +1244,7 @@ export default function StaffChat() {
         </aside>
 
         <div
+          className="hconnect-chat-panel"
           style={{
             flex: 1,
             display: "flex",
@@ -1114,7 +1254,7 @@ export default function StaffChat() {
           }}
         >
           <h2
-            className={cormorant.className}
+            className={`${cormorant.className} hconnect-room-title`}
             style={{
               fontSize: 64,
               color: darkMode ? "#F5EAD7" : "#2B241C",
@@ -1152,6 +1292,7 @@ export default function StaffChat() {
           )}
           {selectedSuite && (
             <div
+              className="hconnect-room-meta"
               style={{
                 display: "flex",
                 gap: 12,
@@ -1201,6 +1342,7 @@ export default function StaffChat() {
           )}
           {selectedRoom && (
             <div
+              className="hconnect-status-actions"
               style={{
                 display: "flex",
                 gap: 10,
@@ -1325,6 +1467,7 @@ export default function StaffChat() {
             </div>
           )}
           <div
+            className="hconnect-messages"
             ref={messagesContainerRef}
             style={{
               flex: 1,
@@ -1361,6 +1504,7 @@ export default function StaffChat() {
                   }}
                 >
                   <div
+                    className="hconnect-message-bubble"
                     style={{
                       maxWidth: "62%",
                       padding: "18px 20px",
@@ -1493,13 +1637,16 @@ export default function StaffChat() {
           </div>
 
           <div
+            className="hconnect-composer"
             style={{
               display: "flex",
               gap: 18,
-              marginTop: 24
+              marginTop: 24,
+              alignItems: "stretch"
             }}
           >
             <input
+              className="hconnect-message-input"
               disabled={!selectedRoom}
               value={message}
               onChange={(e) => {
@@ -1544,6 +1691,7 @@ export default function StaffChat() {
             />
 
             <button
+              className="hconnect-send-button"
               disabled={!selectedRoom}
               onClick={sendMessage}
               style={{
